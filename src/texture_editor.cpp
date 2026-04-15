@@ -482,7 +482,7 @@ void TextureEditorDialog::onAddTexture() {
 
     psb_.textures.push_back(path.toStdString());
     psb_.texture_uv_rects.push_back({0.0f, 0.0f, 0.1f, 0.1f});
-    psb_.num_textures = static_cast<uint32_t>(psb_.textures.size());
+    psb_.num_assets = static_cast<uint32_t>(psb_.textures.size());
     modified_ = true;
     refreshList();
     list_->setCurrentRow(static_cast<int>(psb_.textures.size()) - 1);
@@ -499,7 +499,7 @@ void TextureEditorDialog::onRemoveTexture() {
     psb_.textures.erase(psb_.textures.begin() + row);
     if (row < static_cast<int>(psb_.texture_uv_rects.size()))
         psb_.texture_uv_rects.erase(psb_.texture_uv_rects.begin() + row);
-    psb_.num_textures = static_cast<uint32_t>(psb_.textures.size());
+    psb_.num_assets = static_cast<uint32_t>(psb_.textures.size());
     modified_ = true;
     refreshList();
 }

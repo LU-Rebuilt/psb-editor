@@ -9,8 +9,7 @@ set(CMAKE_AUTOMOC ON)
 
 include(FetchContent)
 FetchContent_Declare(lu_assets
-    GIT_REPOSITORY https://github.com/LU-Rebuilt/lu-assets.git
-    GIT_TAG main
+    SOURCE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../lu-assets
 )
 FetchContent_MakeAvailable(lu_assets)
 

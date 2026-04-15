@@ -53,7 +53,8 @@ void ParticleGLWidget::loadEmitter(const lu::assets::PsbFile& psb) {
 }
 
 void ParticleGLWidget::loadEffect(const lu::assets::EffectFile& effect,
-                                    const QString& effectDir) {
+                                    const QString& effectDir,
+                                    bool resetCamera) {
     clearEmitters();
     for (const auto& ee : effect.emitters) {
         QString psbPath = effectDir + "/" + QString::fromStdString(ee.name) + ".psb";
@@ -67,8 +68,18 @@ void ParticleGLWidget::loadEffect(const lu::assets::EffectFile& effect,
             em.originalData = std::move(data);
         } catch (...) { continue; }
         std::memcpy(em.transform, ee.transform, sizeof(ee.transform));
+        std::memcpy(em.baseTransform, ee.transform, sizeof(ee.transform));
+        std::memcpy(em.prevTransform, ee.transform, sizeof(ee.transform));
         em.startDelay = ee.time;
+        em.facing = ee.facing;
         em.trail = ee.trail;
+        em.loop = ee.loop;
+        em.rot = ee.rot;
+        em.ds = ee.ds;
+        em.se = ee.se;
+        em.mt = ee.mt;
+        em.dist = ee.dist;
+        em.dmin = ee.dmin;
         emitters_.push_back(std::move(em));
     }
     if (emitters_.empty()) return;
@@ -78,6 +89,8 @@ void ParticleGLWidget::loadEffect(const lu::assets::EffectFile& effect,
     for (auto& em : emitters_) loadTextureForEmitter(em);
     doneCurrent();
     elapsed_.restart();
+    // Auto-frame all emitters on first load only
+    if (resetCamera) frameAllEmitters();
     setPlaying(true);
     update();
 }
@@ -158,7 +171,7 @@ void ParticleGLWidget::loadTextureForEmitter(EmitterInstance& em) {
     }
 }
 
-// ── Simulation (rewritten to match client 1:1) ──────────────────────────────
+// ── Simulation (matches client: FUN_010d2f90 + FUN_0109bb30) ────────────────
 
 void ParticleGLWidget::tick() {
     if (!loaded_ || !playing_) return;
@@ -167,33 +180,110 @@ void ParticleGLWidget::tick() {
 
     for (auto& em : emitters_) {
         const auto& psb = em.psb;
-        float dt = rawDt * playbackSpeed_ * psb.playback_scale;
+        // Client: adjustedDt = dt * time_delta_mult (FUN_010d2f90)
+        float dt = rawDt * playbackSpeed_ * psb.time_delta_mult;
         totalTime_ += dt / static_cast<float>(emitters_.size());
+
+        // Save previous transform for motion delta (FUN_010d2f90: emitter+0xB0 = emitter+0xA0)
+        std::memcpy(em.prevTransform, em.transform, sizeof(em.transform));
+
+        // Emitter motion preview: orbit around base position
+        if (emitterMotion_) {
+            float orbitRadius = 3.0f;
+            float orbitSpeed = 1.5f;
+            float bobSpeed = 2.0f;
+            float bobHeight = 1.0f;
+            float angle = totalTime_ * orbitSpeed;
+
+            // Orbit XZ + vertical bob
+            em.transform[12] = em.baseTransform[12] + orbitRadius * std::cos(angle);
+            em.transform[13] = em.baseTransform[13] + bobHeight * std::sin(totalTime_ * bobSpeed);
+            em.transform[14] = em.baseTransform[14] + orbitRadius * std::sin(angle);
+
+            // Rotate the emitter to face direction of travel (for ROT flag)
+            float fwd_x = -std::sin(angle);
+            float fwd_z = std::cos(angle);
+            // Set rotation matrix columns (forward = Z, right = X, up = Y)
+            em.transform[0] = fwd_z;  em.transform[1] = 0; em.transform[2] = -fwd_x;
+            em.transform[4] = 0;      em.transform[5] = 1; em.transform[6] = 0;
+            em.transform[8] = fwd_x;  em.transform[9] = 0; em.transform[10] = fwd_z;
+        }
 
         float delay = em.startDelay;
         if (totalTime_ < delay) continue;
 
-        float rate = psb.birth_rate * emissionScale_;
-        float period = std::abs(psb.emit_period);
-        float lifetime = psb.life_max;
-        float cycleDuration = period > 0 ? period : lifetime + psb.death_delay + 0.5f;
         float adjustedTime = totalTime_ - delay;
-        float cycleTime = std::fmod(adjustedTime, cycleDuration);
+
+        // Emission rate with accumulator — matching FUN_010d2f90
+        // Client: numToSpawn = emit_rate * adjustedDt, with fractional accumulator
+        float rate = psb.emit_rate * emissionScale_;
+        int maxParts = static_cast<int>(psb.max_particles);
+        if (maxParts <= 0) maxParts = 10000;
+
+        // Determine if we should be emitting
+        float avgLife = psb.life_min + (psb.life_var - psb.life_min) * 0.5f;
+        if (avgLife <= 0) avgLife = 1.0f;
+
+        // LOOP flag from effect file overrides force-loop setting
+        bool shouldLoop = forceLoop_ || (em.loop != 0);
 
         bool emitting;
-        if (period > 0) emitting = true;
-        else if (forceLoop_) emitting = (cycleTime < 0.2f);
-        else emitting = (adjustedTime < 0.2f);
+        if (shouldLoop) {
+            emitting = true;
+        } else {
+            emitting = (adjustedTime < avgLife);
+        }
 
         if (rate > 0 && emitting) {
-            em.emitAccum += rate * dt;
-            while (em.emitAccum >= 1.0f) {
-                em.particles.push_back(psb_spawn_particle(psb, em.transform, rng_));
+            float toSpawn = rate * dt;
+            int intPart = static_cast<int>(toSpawn);
+            em.emitAccum += (toSpawn - static_cast<float>(intPart));
+            if (em.emitAccum >= 1.0f) {
                 em.emitAccum -= 1.0f;
+                intPart++;
+            }
+            // Cap at max_particles — FUN_010d2f90
+            int currentCount = static_cast<int>(em.particles.size());
+            if (currentCount + intPart > maxParts) {
+                intPart = maxParts - currentCount;
+            }
+            for (int i = 0; i < intPart; ++i) {
+                em.particles.push_back(psb_spawn_particle(psb, em.transform, rng_));
             }
         }
 
         psb_tick_particles(em.particles, psb, dt);
+
+        // MT: motion transform — particles follow emitter movement
+        // Client: FUN_01093fc0 checks flags & 0x20000, adds (currentPos - prevPos) to particles
+        if (em.mt != 0 || em.rot != 0) {
+            float dx = em.transform[12] - em.prevTransform[12];
+            float dy = em.transform[13] - em.prevTransform[13];
+            float dz = em.transform[14] - em.prevTransform[14];
+            if (dx != 0 || dy != 0 || dz != 0) {
+                for (auto& p : em.particles) {
+                    p.x += dx;
+                    p.y += dy;
+                    p.z += dz;
+                }
+            }
+        }
+
+        // Record trail history for TRAIL emitters
+        if (em.trail != 0) {
+            // Resize trail history to match particle count
+            em.trailHistory.resize(em.particles.size());
+            for (size_t pi = 0; pi < em.particles.size(); ++pi) {
+                const auto& p = em.particles[pi];
+                float t = p.age / p.maxLife;
+                auto c = psb_lerp_color(psb, t);
+                float sz = psb_lerp_size(p, psb, t);
+                em.trailHistory[pi].push_back({p.x, p.y, p.z, c.r, c.g, c.b, c.a, sz});
+                // Keep max 32 trail points per particle
+                if (em.trailHistory[pi].size() > 32)
+                    em.trailHistory[pi].erase(em.trailHistory[pi].begin());
+            }
+        }
     }
     update();
 }
@@ -230,28 +320,70 @@ void ParticleGLWidget::paintGL() {
     glTranslatef(0, 0, -zoom_);
     glRotatef(-orbitPitch_, 1, 0, 0);
     glRotatef(-orbitYaw_, 0, 1, 0);
+    glTranslatef(-panX_, -panY_, -panZ_);
 
     // Grid + axes
-    glDisable(GL_BLEND);
-    glBegin(GL_LINES);
-    glColor4f(0.3f, 0.3f, 0.3f, 0.5f);
-    for (int i = -5; i <= 5; ++i) {
-        glVertex3f(float(i),0,-5); glVertex3f(float(i),0,5);
-        glVertex3f(-5,0,float(i)); glVertex3f(5,0,float(i));
+    if (showGrid_) {
+        glDisable(GL_BLEND);
+        int gridSize = std::max(5, static_cast<int>(zoom_ * 0.5f));
+        glBegin(GL_LINES);
+        glColor4f(0.3f, 0.3f, 0.3f, 0.5f);
+        for (int i = -gridSize; i <= gridSize; ++i) {
+            glVertex3f(float(i),0,float(-gridSize)); glVertex3f(float(i),0,float(gridSize));
+            glVertex3f(float(-gridSize),0,float(i)); glVertex3f(float(gridSize),0,float(i));
+        }
+        glColor3f(1,0,0); glVertex3f(0,0,0); glVertex3f(1,0,0);
+        glColor3f(0,1,0); glVertex3f(0,0,0); glVertex3f(0,1,0);
+        glColor3f(0,0,1); glVertex3f(0,0,0); glVertex3f(0,0,1);
+        glEnd();
     }
-    glColor3f(1,0,0); glVertex3f(0,0,0); glVertex3f(1,0,0);
-    glColor3f(0,1,0); glVertex3f(0,0,0); glVertex3f(0,1,0);
-    glColor3f(0,0,1); glVertex3f(0,0,0); glVertex3f(0,0,1);
-    glEnd();
 
     if (!loaded_) return;
 
-    for (const auto& em : emitters_) {
+    // SE: extract emitter scale for particles that inherit it
+    // DS: sort emitters by priority before rendering
+    // Build render order (PRIO sorting)
+    std::vector<size_t> renderOrder(emitters_.size());
+    for (size_t i = 0; i < emitters_.size(); ++i) renderOrder[i] = i;
+    std::sort(renderOrder.begin(), renderOrder.end(), [this](size_t a, size_t b) {
+        // Lower priority renders first (background)
+        return emitters_[a].psb.blend_mode < emitters_[b].psb.blend_mode;
+    });
+
+    // Camera position in world space (for distance culling)
+    float camYawR = orbitYaw_ * DEG_TO_RAD;
+    float camPitchR = orbitPitch_ * DEG_TO_RAD;
+    float camX = panX_ + zoom_ * std::sin(camYawR) * std::cos(camPitchR);
+    float camY = panY_ + zoom_ * std::sin(camPitchR);
+    float camZ = panZ_ + zoom_ * std::cos(camYawR) * std::cos(camPitchR);
+
+    for (size_t ei : renderOrder) {
+        const auto& em = emitters_[ei];
         const auto& psb = em.psb;
+
+        // DIST/DMIN culling — skip emitter if camera is outside distance range
+        if (em.dist > 0.0f || em.dmin > 0.0f) {
+            float dx = camX - em.transform[12];
+            float dy = camY - em.transform[13];
+            float dz = camZ - em.transform[14];
+            float distSq = dx*dx + dy*dy + dz*dz;
+            if (em.dist > 0.0f && distSq > em.dist * em.dist) continue;
+            if (em.dmin > 0.0f && distSq < em.dmin * em.dmin) continue;
+        }
+
+        // SE: compute emitter scale factor from transform matrix
+        float emitterScale = 1.0f;
+        if (em.se != 0) {
+            // Extract scale from first column of transform matrix
+            float sx = std::sqrt(em.transform[0]*em.transform[0] +
+                                 em.transform[1]*em.transform[1] +
+                                 em.transform[2]*em.transform[2]);
+            emitterScale = sx;
+        }
 
         // Blend mode from FUN_01092380
         glEnable(GL_BLEND);
-        switch (psb.texture_blend_mode) {
+        switch (psb.blend_mode) {
             case 1: glBlendFunc(GL_SRC_ALPHA, GL_ONE); break;
             case 2: glBlendFunc(GL_ONE, GL_ONE_MINUS_SRC_COLOR); break;
             case 3: glBlendFunc(GL_DST_COLOR, GL_ZERO); break;
@@ -267,43 +399,200 @@ void ParticleGLWidget::paintGL() {
             glBindTexture(GL_TEXTURE_2D, em.textureId);
         }
 
-        for (const auto& p : em.particles) {
-            float t = 1.0f - (p.life / p.maxLife);
-            auto c = psb_lerp_color(psb, t);
-            float sz = psb_lerp_size(psb, t);
-            float age = p.maxLife - p.life;
-            int texIdx = psb_texture_index(psb, age);
+        // DS: sort particles back-to-front by camera distance
+        std::vector<size_t> particleOrder(em.particles.size());
+        for (size_t i = 0; i < em.particles.size(); ++i) particleOrder[i] = i;
+        if (em.ds != 0) {
+            std::sort(particleOrder.begin(), particleOrder.end(),
+                [&](size_t a, size_t b) {
+                    const auto& pa = em.particles[a];
+                    const auto& pb = em.particles[b];
+                    float da = (pa.x-camX)*(pa.x-camX) + (pa.y-camY)*(pa.y-camY) + (pa.z-camZ)*(pa.z-camZ);
+                    float db = (pb.x-camX)*(pb.x-camX) + (pb.y-camY)*(pb.y-camY) + (pb.z-camZ)*(pb.z-camZ);
+                    return da > db; // far first
+                });
+        }
 
-            glPushMatrix();
-            glTranslatef(p.x, p.y, p.z);
-            // Billboard
-            glRotatef(orbitYaw_, 0, 1, 0);
-            glRotatef(orbitPitch_, 1, 0, 0);
-            glRotatef(p.rotation / DEG_TO_RAD, 0, 0, 1); // back to degrees for GL
+        // Decode particle rendering mode from PSB flags
+        auto particleMode = lu::assets::decode_particle_mode(psb.flags);
+        bool isVelocityAligned =
+            (particleMode == lu::assets::ParticleMode::VelocityStreak ||
+             particleMode == lu::assets::ParticleMode::VelocityStreakNoDrag);
+
+        for (size_t pi : particleOrder) {
+            const auto& p = em.particles[pi];
+            float t = p.age / p.maxLife;
+            auto c = psb_lerp_color(psb, t);
+            float sz = psb_lerp_size(p, psb, t) * emitterScale; // SE: scale by emitter
+            int texIdx = psb_texture_index(psb, p);
+
+            float u0 = 0, v0 = 0, u1 = 1, v1 = 1;
+            if (em.hasTexture && texIdx >= 0 && texIdx < static_cast<int>(psb.texture_uv_rects.size())) {
+                u0 = psb.texture_uv_rects[texIdx].u_min;
+                v0 = psb.texture_uv_rects[texIdx].v_min;
+                u1 = psb.texture_uv_rects[texIdx].u_max;
+                v1 = psb.texture_uv_rects[texIdx].v_max;
+            }
 
             glColor4f(c.r, c.g, c.b, c.a);
-            glBegin(GL_QUADS);
-            if (em.hasTexture && texIdx >= 0 && texIdx < static_cast<int>(psb.texture_uv_rects.size())) {
-                float u0 = psb.texture_uv_rects[texIdx].u_min;
-                float v0 = psb.texture_uv_rects[texIdx].v_min;
-                float u1 = psb.texture_uv_rects[texIdx].u_max;
-                float v1 = psb.texture_uv_rects[texIdx].v_max;
-                glTexCoord2f(u0,v1); glVertex3f(-sz,-sz,0);
-                glTexCoord2f(u1,v1); glVertex3f( sz,-sz,0);
-                glTexCoord2f(u1,v0); glVertex3f( sz, sz,0);
-                glTexCoord2f(u0,v0); glVertex3f(-sz, sz,0);
+
+            if (isVelocityAligned) {
+                // Velocity-aligned streak: quad stretches along velocity direction
+                // The particle becomes a streak/spark oriented by its velocity
+                float speed = std::sqrt(p.vx*p.vx + p.vy*p.vy + p.vz*p.vz);
+                if (speed < 0.001f) {
+                    // No velocity — fall back to billboard
+                    glPushMatrix();
+                    glTranslatef(p.x, p.y, p.z);
+                    glRotatef(orbitYaw_, 0, 1, 0);
+                    glRotatef(orbitPitch_, 1, 0, 0);
+                    glBegin(GL_QUADS);
+                    if (em.hasTexture) {
+                        glTexCoord2f(u0,v1); glVertex3f(-sz,-sz,0);
+                        glTexCoord2f(u1,v1); glVertex3f( sz,-sz,0);
+                        glTexCoord2f(u1,v0); glVertex3f( sz, sz,0);
+                        glTexCoord2f(u0,v0); glVertex3f(-sz, sz,0);
+                    } else {
+                        glVertex3f(-sz,-sz,0); glVertex3f(sz,-sz,0);
+                        glVertex3f(sz,sz,0); glVertex3f(-sz,sz,0);
+                    }
+                    glEnd();
+                    glPopMatrix();
+                } else {
+                    // Build streak quad aligned to velocity, perpendicular to camera
+                    float dirX = p.vx / speed, dirY = p.vy / speed, dirZ = p.vz / speed;
+
+                    // Camera direction (view vector)
+                    float cyR = orbitYaw_ * DEG_TO_RAD, cpR = orbitPitch_ * DEG_TO_RAD;
+                    float viewX = std::sin(cyR) * std::cos(cpR);
+                    float viewY = std::sin(cpR);
+                    float viewZ = std::cos(cyR) * std::cos(cpR);
+
+                    // Cross product: right = velocity × view (perpendicular to both)
+                    float rx = dirY * viewZ - dirZ * viewY;
+                    float ry = dirZ * viewX - dirX * viewZ;
+                    float rz = dirX * viewY - dirY * viewX;
+                    float rLen = std::sqrt(rx*rx + ry*ry + rz*rz);
+                    if (rLen > 0.001f) { rx /= rLen; ry /= rLen; rz /= rLen; }
+
+                    // Streak length proportional to speed, width = sz
+                    float halfW = sz * 0.5f;
+                    float halfL = sz + speed * 0.05f; // stretch by velocity
+
+                    // 4 corners: along velocity ± halfL, perpendicular ± halfW
+                    float x0 = p.x - dirX * halfL - rx * halfW;
+                    float y0 = p.y - dirY * halfL - ry * halfW;
+                    float z0 = p.z - dirZ * halfL - rz * halfW;
+                    float x1 = p.x + dirX * halfL - rx * halfW;
+                    float y1 = p.y + dirY * halfL - ry * halfW;
+                    float z1 = p.z + dirZ * halfL - rz * halfW;
+                    float x2 = p.x + dirX * halfL + rx * halfW;
+                    float y2 = p.y + dirY * halfL + ry * halfW;
+                    float z2 = p.z + dirZ * halfL + rz * halfW;
+                    float x3 = p.x - dirX * halfL + rx * halfW;
+                    float y3 = p.y - dirY * halfL + ry * halfW;
+                    float z3 = p.z - dirZ * halfL + rz * halfW;
+
+                    glBegin(GL_QUADS);
+                    if (em.hasTexture) {
+                        glTexCoord2f(u0,v1); glVertex3f(x0,y0,z0);
+                        glTexCoord2f(u1,v1); glVertex3f(x1,y1,z1);
+                        glTexCoord2f(u1,v0); glVertex3f(x2,y2,z2);
+                        glTexCoord2f(u0,v0); glVertex3f(x3,y3,z3);
+                    } else {
+                        glVertex3f(x0,y0,z0); glVertex3f(x1,y1,z1);
+                        glVertex3f(x2,y2,z2); glVertex3f(x3,y3,z3);
+                    }
+                    glEnd();
+                }
             } else {
-                glVertex3f(-sz,-sz,0); glVertex3f(sz,-sz,0);
-                glVertex3f(sz,sz,0); glVertex3f(-sz,sz,0);
+                // Billboard modes (0, 1, 3, 4, and model fallback 6-9)
+                glPushMatrix();
+                glTranslatef(p.x, p.y, p.z);
+
+                // Facing mode (from effect FACING property)
+                switch (em.facing) {
+                    case 0:
+                        glRotatef(orbitYaw_, 0, 1, 0);
+                        glRotatef(orbitPitch_, 1, 0, 0);
+                        break;
+                    case 1: glRotatef(90.0f, 0, 1, 0); break;
+                    case 2: glRotatef(90.0f, 1, 0, 0); break;
+                    case 3: break;
+                    case 4: {
+                        float ex = em.transform[8], ey = em.transform[9], ez = em.transform[10];
+                        float yaw = std::atan2(ex, ez) / DEG_TO_RAD;
+                        float pitch = std::asin(std::clamp(-ey, -1.0f, 1.0f)) / DEG_TO_RAD;
+                        glRotatef(yaw, 0, 1, 0);
+                        glRotatef(pitch, 1, 0, 0);
+                        break;
+                    }
+                    case 5: {
+                        float ox = em.transform[12], oy = em.transform[13], oz = em.transform[14];
+                        float rdx = p.x - ox, rdy = p.y - oy, rdz = p.z - oz;
+                        float len = std::sqrt(rdx*rdx + rdy*rdy + rdz*rdz);
+                        if (len > 0.001f) {
+                            float yaw = std::atan2(rdx, rdz) / DEG_TO_RAD;
+                            float pitch = std::asin(std::clamp(-rdy / len, -1.0f, 1.0f)) / DEG_TO_RAD;
+                            glRotatef(yaw, 0, 1, 0);
+                            glRotatef(pitch, 1, 0, 0);
+                        } else {
+                            glRotatef(orbitYaw_, 0, 1, 0);
+                            glRotatef(orbitPitch_, 1, 0, 0);
+                        }
+                        break;
+                    }
+                    default:
+                        glRotatef(orbitYaw_, 0, 1, 0);
+                        glRotatef(orbitPitch_, 1, 0, 0);
+                        break;
+                }
+                glRotatef(p.rotation / DEG_TO_RAD, 0, 0, 1);
+
+                glBegin(GL_QUADS);
+                if (em.hasTexture) {
+                    glTexCoord2f(u0,v1); glVertex3f(-sz,-sz,0);
+                    glTexCoord2f(u1,v1); glVertex3f( sz,-sz,0);
+                    glTexCoord2f(u1,v0); glVertex3f( sz, sz,0);
+                    glTexCoord2f(u0,v0); glVertex3f(-sz, sz,0);
+                } else {
+                    glVertex3f(-sz,-sz,0); glVertex3f(sz,-sz,0);
+                    glVertex3f(sz,sz,0); glVertex3f(-sz,sz,0);
+                }
+                glEnd();
+                glPopMatrix();
             }
-            glEnd();
-            glPopMatrix();
         }
 
         if (em.hasTexture) {
             glBindTexture(GL_TEXTURE_2D, 0);
             glDisable(GL_TEXTURE_2D);
         }
+
+        // Trail rendering — camera-facing ribbon strips with width from particle size
+        if (em.trail != 0 && !em.trailHistory.empty()) {
+            glDisable(GL_TEXTURE_2D);
+            for (size_t pi = 0; pi < em.trailHistory.size(); ++pi) {
+                const auto& trail = em.trailHistory[pi];
+                if (trail.size() < 2) continue;
+                glBegin(GL_QUAD_STRIP);
+                for (size_t ti = 0; ti < trail.size(); ++ti) {
+                    const auto& tp = trail[ti];
+                    float trailFade = static_cast<float>(ti) / static_cast<float>(trail.size() - 1);
+                    float w = tp.size * lu::assets::PSB_SIZE_SCALE * trailFade * emitterScale;
+                    glColor4f(tp.r, tp.g, tp.b, tp.a * trailFade);
+                    // Camera-facing ribbon: offset perpendicular to view direction
+                    float upX = std::sin(orbitYaw_ * DEG_TO_RAD) * std::sin(orbitPitch_ * DEG_TO_RAD);
+                    float upY = std::cos(orbitPitch_ * DEG_TO_RAD);
+                    float upZ = std::cos(orbitYaw_ * DEG_TO_RAD) * std::sin(orbitPitch_ * DEG_TO_RAD);
+                    // Simplified: use world Y as up for ribbon
+                    glVertex3f(tp.x - w * 0.1f, tp.y + w, tp.z);
+                    glVertex3f(tp.x + w * 0.1f, tp.y - w, tp.z);
+                }
+                glEnd();
+            }
+        }
+
         glDepthMask(GL_TRUE);
     }
     glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -315,15 +604,70 @@ void ParticleGLWidget::mouseMoveEvent(QMouseEvent* e) {
     int dy = e->pos().y() - lastMouse_.y();
     lastMouse_ = e->pos();
     if (e->buttons() & Qt::LeftButton) {
+        // Orbit camera
         orbitYaw_ += dx * 0.5f;
         orbitPitch_ += dy * 0.5f;
         orbitPitch_ = std::clamp(orbitPitch_, -89.0f, 89.0f);
         update();
+    } else if (e->buttons() & Qt::MiddleButton) {
+        // Pan camera — move in screen-space plane
+        float panSpeed = zoom_ * 0.003f;
+        float yawRad = orbitYaw_ * DEG_TO_RAD;
+        float pitchRad = orbitPitch_ * DEG_TO_RAD;
+
+        // Right vector in world space
+        float rx = std::cos(yawRad);
+        float rz = -std::sin(yawRad);
+
+        // Up vector in world space (simplified)
+        float ux = std::sin(yawRad) * std::sin(pitchRad);
+        float uy = std::cos(pitchRad);
+        float uz = std::cos(yawRad) * std::sin(pitchRad);
+
+        panX_ -= (rx * dx + ux * dy) * panSpeed;
+        panY_ -= (         uy * dy) * panSpeed;
+        panZ_ -= (rz * dx + uz * dy) * panSpeed;
+        update();
+    } else if (e->buttons() & Qt::RightButton) {
+        // Zoom with right-drag (vertical)
+        zoom_ -= dy * zoom_ * 0.005f;
+        zoom_ = std::clamp(zoom_, 0.1f, 5000.0f);
+        update();
     }
 }
 void ParticleGLWidget::wheelEvent(QWheelEvent* e) {
-    zoom_ -= e->angleDelta().y() * 0.005f;
-    zoom_ = std::clamp(zoom_, 0.5f, 100.0f);
+    // Smooth zoom — proportional to current distance
+    float factor = 1.0f - e->angleDelta().y() * 0.001f;
+    zoom_ *= factor;
+    zoom_ = std::clamp(zoom_, 0.1f, 5000.0f);
+    update();
+}
+
+void ParticleGLWidget::frameAllEmitters() {
+    if (emitters_.empty()) return;
+
+    // Compute bounding box of all emitter positions
+    float minX = 1e9f, minY = 1e9f, minZ = 1e9f;
+    float maxX = -1e9f, maxY = -1e9f, maxZ = -1e9f;
+    for (const auto& em : emitters_) {
+        float x = em.transform[12];
+        float y = em.transform[13];
+        float z = em.transform[14];
+        minX = std::min(minX, x); maxX = std::max(maxX, x);
+        minY = std::min(minY, y); maxY = std::max(maxY, y);
+        minZ = std::min(minZ, z); maxZ = std::max(maxZ, z);
+    }
+
+    // Center pan on the midpoint
+    panX_ = (minX + maxX) * 0.5f;
+    panY_ = (minY + maxY) * 0.5f;
+    panZ_ = (minZ + maxZ) * 0.5f;
+
+    // Set zoom to fit the bounding box with some margin
+    float extent = std::max({maxX - minX, maxY - minY, maxZ - minZ, 2.0f});
+    zoom_ = extent * 2.0f;
+    zoom_ = std::clamp(zoom_, 1.0f, 5000.0f);
+
     update();
 }
 

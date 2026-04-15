@@ -146,6 +146,46 @@ MainWindow::MainWindow(QWidget* parent)
         glWidget_->setForceLoop(checked);
     });
 
+    auto* gridCheck = new QCheckBox("Grid");
+    gridCheck->setChecked(true);
+    toolbar->addWidget(gridCheck);
+    connect(gridCheck, &QCheckBox::toggled, [this](bool checked) {
+        glWidget_->setShowGrid(checked);
+    });
+
+    toolbar->addSeparator();
+
+    auto* motionCheck = new QCheckBox("Emitter Motion");
+    motionCheck->setChecked(false);
+    motionCheck->setToolTip("Preview emitter movement (orbit + bob) to test ROT/MT/Trail flags");
+    toolbar->addWidget(motionCheck);
+    connect(motionCheck, &QCheckBox::toggled, [this](bool checked) {
+        glWidget_->setEmitterMotion(checked);
+    });
+
+    // Help menu
+    auto* helpMenu = menuBar()->addMenu("&Help");
+    helpMenu->addAction("&Controls", [this]() {
+        QMessageBox::information(this, "Controls",
+            "Camera Controls:\n"
+            "  Left drag: Orbit\n"
+            "  Middle drag: Pan\n"
+            "  Right drag: Zoom\n"
+            "  Scroll wheel: Zoom\n\n"
+            "Shortcuts:\n"
+            "  Ctrl+O: Open PSB/Effect\n"
+            "  Ctrl+S: Save\n"
+            "  Ctrl+T: Edit Textures\n"
+            "  Ctrl+R: Restart\n"
+            "  Space: Play/Pause\n"
+            "  Ctrl+Z / Ctrl+Shift+Z: Undo/Redo\n\n"
+            "Toolbar Toggles:\n"
+            "  Force Loop: Continuously re-emit particles\n"
+            "  Grid: Show/hide ground grid and axes\n"
+            "  Emitter Motion: Preview particles on a moving\n"
+            "    emitter (orbit + bob) to test ROT/MT/Trail");
+    });
+
     // Tree edit signals
     connect(tree_, &QTreeWidget::itemChanged, this, &MainWindow::onTreeItemChanged);
     connect(tree_, &QTreeWidget::itemDoubleClicked, this, &MainWindow::onTreeItemDoubleClicked);
@@ -249,7 +289,7 @@ bool MainWindow::openFile(const QString& path) {
         QString::fromStdString(psb_.textures[0]);
     statusLabel_->setText(
         QString("Particle %1 | %2 tex | %3 bytes | %4")
-            .arg(psb_.particle_id).arg(psb_.num_textures)
+            .arg(psb_.particle_id).arg(psb_.num_assets)
             .arg(psb_.file_total_size).arg(texInfo));
 
     return true;
@@ -336,20 +376,56 @@ void MainWindow::onSetClientRoot() {
 void MainWindow::onEditTextures() {
     if (!loaded_) return;
 
-    // Snapshot state before editing
-    auto oldTex = psb_.textures;
-    auto oldUVs = psb_.texture_uv_rects;
-    auto oldNum = psb_.num_textures;
-
     QSettings settings;
     QString root = settings.value("psb_client_root").toString();
-    TextureEditorDialog dlg(psb_, root, this);
-    dlg.exec();
 
-    if (dlg.wasModified()) {
-        undoStack_->push(new EditTexturesCommand(
-            this, oldTex, oldUVs, oldNum,
-            psb_.textures, psb_.texture_uv_rects, psb_.num_textures));
+    if (isEffect_ && glWidget_->emitterCount() > 1) {
+        // Effect mode: let user pick which emitter to edit
+        QStringList items;
+        for (int i = 0; i < glWidget_->emitterCount(); ++i) {
+            auto& ep = glWidget_->emitterPsb(i);
+            QString label = QString("Emitter %1").arg(i);
+            if (i < static_cast<int>(effect_.emitters.size()))
+                label += QString(" (%1)").arg(QString::fromStdString(effect_.emitters[i].name));
+            if (!ep.textures.empty())
+                label += QString(" - %1 tex").arg(ep.textures.size());
+            items << label;
+        }
+
+        bool ok;
+        QString chosen = QInputDialog::getItem(this, "Edit Textures",
+            "Select emitter:", items, 0, false, &ok);
+        if (!ok) return;
+        int emIdx = items.indexOf(chosen);
+        if (emIdx < 0) return;
+
+        auto& targetPsb = glWidget_->emitterPsb(emIdx);
+        auto oldTex = targetPsb.textures;
+        auto oldUVs = targetPsb.texture_uv_rects;
+        auto oldNum = targetPsb.num_assets;
+
+        TextureEditorDialog dlg(targetPsb, root, this);
+        dlg.exec();
+
+        if (dlg.wasModified()) {
+            glWidget_->reloadEmitterTexture(emIdx);
+            statusBar()->showMessage(
+                QString("Textures updated for emitter %1").arg(emIdx), 5000);
+        }
+    } else {
+        // Single PSB mode or single-emitter effect
+        auto oldTex = psb_.textures;
+        auto oldUVs = psb_.texture_uv_rects;
+        auto oldNum = psb_.num_assets;
+
+        TextureEditorDialog dlg(psb_, root, this);
+        dlg.exec();
+
+        if (dlg.wasModified()) {
+            undoStack_->push(new EditTexturesCommand(
+                this, oldTex, oldUVs, oldNum,
+                psb_.textures, psb_.texture_uv_rects, psb_.num_assets));
+        }
     }
 }
 
@@ -363,30 +439,30 @@ void MainWindow::onAddKeyframe() {
 
     // Create a new keyframe from current emitter state
     lu::assets::PsbFile::AnimKeyframe kf;
-    kf.start_color = psb_.start_color;
-    kf.middle_color = psb_.middle_color;
-    kf.end_color = psb_.end_color;
-    kf.birth_color = psb_.birth_color;
-    kf.birth_delay = psb_.birth_delay;
+    kf.initial_color = psb_.initial_color;
+    kf.trans_color_1 = psb_.trans_color_1;
+    kf.trans_color_2 = psb_.trans_color_2;
+    kf.final_color = psb_.final_color;
+    kf.color_ratio_1 = psb_.color_ratio_1;
+    kf.color_ratio_2 = psb_.color_ratio_2;
     kf.life_min = psb_.life_min;
-    kf.life_max = psb_.life_max;
-    kf.birth_rate = psb_.birth_rate;
-    kf.death_delay = psb_.death_delay;
-    kf.emit_period = psb_.emit_period;
+    kf.life_var = psb_.life_var;
+    kf.vel_min = psb_.vel_min;
+    kf.vel_var = psb_.vel_var;
     kf.flags = psb_.flags;
-    kf.emit_speed = psb_.emit_speed;
-    kf.speed_x = psb_.speed_x;
-    kf.speed_y = psb_.speed_y;
-    kf.speed_z = psb_.speed_z;
-    kf.gravity = psb_.gravity;
-    kf.spread_angle = psb_.spread_angle;
-    kf.rotation_speed = psb_.rotation_speed;
-    kf.size_start = psb_.size_start;
-    kf.size_end = psb_.size_end;
-    kf.size_mult = psb_.size_mult;
-    kf.size_alpha = psb_.size_alpha;
-    kf.initial_rotation = psb_.initial_rotation;
-    kf.color2 = psb_.color2;
+    kf.initial_scale = psb_.initial_scale;
+    kf.trans_scale = psb_.trans_scale;
+    kf.final_scale = psb_.final_scale;
+    kf.scale_ratio = psb_.scale_ratio;
+    kf.rot_min = psb_.rot_min;
+    kf.rot_var = psb_.rot_var;
+    kf.drag = psb_.drag;
+    kf.scale_x = psb_.scale[0];
+    kf.scale_y = psb_.scale[1];
+    kf.scale_z = psb_.scale[2];
+    kf.scale_w = psb_.scale[3];
+    kf.rotation_x = psb_.rotation[0];
+    kf.tint = psb_.tint;
 
     psb_.anim_timeline.keyframes.push_back(std::move(kf));
     psb_.anim_timeline.frame_offsets.push_back(0); // placeholder offset
@@ -455,7 +531,7 @@ void MainWindow::onTogglePlay() {
 void MainWindow::onRestart() {
     if (!loaded_) return;
     if (isEffect_) {
-        glWidget_->loadEffect(effect_, effectDir_);
+        glWidget_->loadEffect(effect_, effectDir_, /*resetCamera=*/false);
     } else {
         glWidget_->loadEmitter(psb_);
     }
@@ -699,62 +775,12 @@ void MainWindow::buildTree() {
     colorItems_.clear();
     if (!loaded_) { buildingTree_ = false; return; }
 
-    // Effect emitter list (when loaded from .txt)
-    if (isEffect_ && !effect_.emitters.empty()) {
-        auto* effectRoot = new QTreeWidgetItem(tree_);
-        effectRoot->setText(0, QString("Effect (%1 emitters)").arg(effect_.emitters.size()));
-        effectRoot->setExpanded(true);
-
-        for (size_t i = 0; i < effect_.emitters.size(); ++i) {
-            auto& ee = effect_.emitters[i];
-            auto* emItem = new QTreeWidgetItem(effectRoot);
-            emItem->setText(0, QString("Emitter %1").arg(i));
-            emItem->setText(1, QString::fromStdString(ee.name));
-
-            // Transform — show translation (last row of 4x4)
-            addReadonly(emItem, "Position",
-                QString("(%1, %2, %3)")
-                    .arg(static_cast<double>(ee.transform[12]), 0, 'f', 2)
-                    .arg(static_cast<double>(ee.transform[13]), 0, 'f', 2)
-                    .arg(static_cast<double>(ee.transform[14]), 0, 'f', 2));
-
-            // Editable properties
-            addFloat(emItem, "Transform X", ee.transform[12]);
-            addFloat(emItem, "Transform Y", ee.transform[13]);
-            addFloat(emItem, "Transform Z", ee.transform[14]);
-            addFloat(emItem, "Distance", ee.dist);
-            addFloat(emItem, "Min Distance", ee.dmin);
-
-            // These are stored as int but we can edit as uint
-            auto* facingItem = new QTreeWidgetItem(emItem);
-            facingItem->setFlags(facingItem->flags() | Qt::ItemIsEditable);
-            facingItem->setText(0, "Facing");
-            facingItem->setText(1, QString::number(ee.facing));
-
-            auto* rotItem = new QTreeWidgetItem(emItem);
-            rotItem->setFlags(rotItem->flags() | Qt::ItemIsEditable);
-            rotItem->setText(0, "Rotate");
-            rotItem->setText(1, QString::number(ee.rot));
-
-            auto* trailItem = new QTreeWidgetItem(emItem);
-            trailItem->setFlags(trailItem->flags() | Qt::ItemIsEditable);
-            trailItem->setText(0, "Trail");
-            trailItem->setText(1, QString::number(ee.trail));
-
-            auto* prioItem = new QTreeWidgetItem(emItem);
-            prioItem->setFlags(prioItem->flags() | Qt::ItemIsEditable);
-            prioItem->setText(0, "Priority");
-            prioItem->setText(1, QString::number(ee.prio));
-
-            auto* loopItem = new QTreeWidgetItem(emItem);
-            loopItem->setFlags(loopItem->flags() | Qt::ItemIsEditable);
-            loopItem->setText(0, "Loop");
-            loopItem->setText(1, QString::number(ee.loop));
-        }
-    }
-
     if (isEffect_ && !effect_.emitters.empty()) {
         // Effect mode: each emitter gets its own subtree
+        static const char* facingNames[] = {
+            "Camera Billboard", "World X", "World Y", "World Z", "Emitter", "Radial"
+        };
+
         for (size_t i = 0; i < effect_.emitters.size(); ++i) {
             auto& ee = effect_.emitters[i];
             auto* emRoot = new QTreeWidgetItem(tree_);
@@ -764,26 +790,31 @@ void MainWindow::buildTree() {
             // Effect properties for this emitter
             auto* props = new QTreeWidgetItem(emRoot);
             props->setText(0, "Effect Properties");
+            props->setExpanded(true);
             addFloat(props, "Position X", ee.transform[12]);
             addFloat(props, "Position Y", ee.transform[13]);
             addFloat(props, "Position Z", ee.transform[14]);
-            addFloat(props, "Distance", ee.dist);
-            addFloat(props, "Min Distance", ee.dmin);
-
-            auto addIntReadonly = [&](QTreeWidgetItem* parent, const QString& name, int val) {
-                addReadonly(parent, name, QString::number(val));
-            };
-            addIntReadonly(props, "Facing", ee.facing);
-            addIntReadonly(props, "Rotate", ee.rot);
-            addIntReadonly(props, "Trail", ee.trail);
-            addIntReadonly(props, "Priority", ee.prio);
-            addIntReadonly(props, "Loop", ee.loop);
             if (ee.time > 0)
-                addReadonly(props, "Start Delay", QString::number(static_cast<double>(ee.time), 'f', 3) + " s");
+                addReadonly(props, "Start Delay (TIME)", QString::number(static_cast<double>(ee.time), 'f', 3) + " s");
+            addFloat(props, "Max Distance (DIST)", ee.dist);
+            addFloat(props, "Min Distance (DMIN)", ee.dmin);
+
+            // Facing mode with human-readable name
+            const char* faceName = (ee.facing >= 0 && ee.facing <= 5) ? facingNames[ee.facing] : "Unknown";
+            addReadonly(props, "Facing (FACING)", QString("%1 (%2)").arg(faceName).arg(ee.facing));
+
+            // Boolean flags — show with descriptions
+            addReadonly(props, "Rotate (ROT)", ee.rot ? "Yes — particles rotate with emitter" : "No");
+            addReadonly(props, "Trail (TRAIL)", ee.trail ? "Yes — connected trail geometry" : "No");
+            addReadonly(props, "Distance Sort (DS)", ee.ds ? "Yes — back-to-front sort" : "No");
+            addReadonly(props, "Scale by Emitter (SE)", ee.se ? "Yes — inherit emitter scale" : "No");
+            addReadonly(props, "Motion Transform (MT)", ee.mt ? "Yes — local-space movement" : "No");
+            addReadonly(props, "Loop (LOOP)", ee.loop ? "Yes — emitter loops" : "No");
+            addReadonly(props, "Priority (PRIO)", QString::number(ee.prio));
 
             // PSB particle data for this emitter
             if (i < static_cast<size_t>(glWidget_->emitterCount())) {
-                buildPsbTree(emRoot, glWidget_->primaryPsb()); // TODO: access per-emitter PSB
+                buildPsbTree(emRoot, glWidget_->emitterPsb(static_cast<int>(i)));
             }
         }
     } else {
@@ -819,103 +850,114 @@ void MainWindow::buildPsbTree(QTreeWidgetItem* parent, lu::assets::PsbFile& p) {
     addReadonly(hdr, "Section Offset", QString::number(p.section_offset));
     addReadonly(hdr, "File Size", QString::number(p.file_total_size));
     addReadonly(hdr, "Params Size", QString::number(p.emitter_params_size));
-    addReadonly(hdr, "Format Const", QString::number(static_cast<double>(p.format_const), 'f', 1));
     if (!p.emitter_name.empty())
         addReadonly(hdr, "Emitter Name", QString::fromStdString(p.emitter_name));
-    addHex(hdr, "Flags", p.flags);
+    addHex(hdr, "Flags (*PFLAGS)", p.flags);
+    // Decode and show particle rendering mode from flags
+    {
+        auto mode = lu::assets::decode_particle_mode(p.flags);
+        static const char* modeNames[] = {
+            "Billboard", "Billboard (neg rot)", "Velocity Streak",
+            "Billboard Alt", "Billboard (neg rot 2)", "Velocity Streak (no drag)",
+            "3D Model", "3D Model (2)", "3D Model (neg rot)", "3D Model (4)"
+        };
+        int mi = static_cast<int>(mode);
+        QString modeStr = (mi >= 0 && mi <= 9) ? modeNames[mi] : "Unknown";
+        addReadonly(hdr, "Particle Mode", QString("%1 (%2)").arg(modeStr).arg(mi));
+        if (p.flags & 0x100) addReadonly(hdr, "Skip Drag/Forces", "Yes (flags & 0x100)");
+        if (p.flags & 0x200000) addReadonly(hdr, "Spin Direction", "Always positive (flags & 0x200000)");
+        if (p.flags & 0x400000) addReadonly(hdr, "Spin Direction", "Always negative (flags & 0x400000)");
+    }
 
-    // Colors
+    // Colors — official ForkParticle names from MediaFX
     auto* colors = makeSection("Colors");
     colors->setExpanded(true);
-    addColor(colors, "Start Color", p.start_color);
-    addColor(colors, "Middle Color", p.middle_color);
-    addColor(colors, "End Color", p.end_color);
-    addColor(colors, "Birth Color", p.birth_color);
-    addColor(colors, "Color 2", p.color2);
+    addColor(colors, "Initial Color (*PICOLOR)", p.initial_color);
+    addColor(colors, "Transitional Color 1 (*PTCOLOR1)", p.trans_color_1);
+    addColor(colors, "Transitional Color 2 (*PTCOLOR2)", p.trans_color_2);
+    addColor(colors, "Final Color (*PFCOLOR)", p.final_color);
+    addColor(colors, "Tint (*TINT)", p.tint);
+    addFloat(colors, "Color Ratio 1 (*PCOLORRATIO)", p.color_ratio_1);
+    addFloat(colors, "Color Ratio 2 (*PCOLORRATIO2)", p.color_ratio_2);
 
-    // Timing
-    auto* timing = makeSection("Timing");
-    timing->setExpanded(true);
-    addFloat(timing, "Birth Delay", p.birth_delay, "s");
-    addFloat(timing, "Life Min", p.life_min, "s");
-    addFloat(timing, "Life Max", p.life_max, "s");
-    addFloat(timing, "Birth Rate", p.birth_rate, "/s");
-    addFloat(timing, "Death Delay", p.death_delay, "s");
-    addFloat(timing, "Emit Period", p.emit_period, "s");
-    addFloat(timing, "Emit Rate Final", p.emit_rate_final);
-    addFloat(timing, "Playback Scale", p.playback_scale, "x");
-    addUint(timing, "Loop Count", p.loop_count);
+    // Particle Properties
+    auto* particle = makeSection("Particle Properties");
+    particle->setExpanded(true);
+    addFloat(particle, "Life Min (*PLIFEMIN)", p.life_min, "s");
+    addFloat(particle, "Life Variance (*PLIFEVAR)", p.life_var, "s");
+    addFloat(particle, "Velocity Min (*PVELMIN)", p.vel_min, "u/s");
+    addFloat(particle, "Velocity Variance (*PVELVAR)", p.vel_var, "u/s");
 
-    // Velocity
-    auto* vel = makeSection("Velocity");
-    vel->setExpanded(true);
-    addFloat(vel, "Emit Speed", p.emit_speed, "u/s");
-    addFloat(vel, "Speed X", p.speed_x, "u/s");
-    addFloat(vel, "Speed Y", p.speed_y, "u/s");
-    addFloat(vel, "Speed Z", p.speed_z, "u/s");
-    addFloat(vel, "Gravity", p.gravity, "u/s2");
-    addFloat(vel, "Spread Angle", p.spread_angle, "deg");
+    // Scale
+    auto* size = makeSection("Scale");
+    size->setExpanded(true);
+    addFloat(size, "Initial Scale (*PISCALE)", p.initial_scale);
+    addFloat(size, "Transitional Scale (*PTSCALE)", p.trans_scale);
+    addFloat(size, "Final Scale (*PFSCALE)", p.final_scale);
+    addFloat(size, "Scale Ratio (*PSCALERATIO)", p.scale_ratio);
+    addFloat(size, "Scale X (*SCALE[0])", p.scale[0]);
+    addFloat(size, "Scale Y (*SCALE[1])", p.scale[1]);
+    addFloat(size, "Scale Z (*SCALE[2])", p.scale[2]);
+    addFloat(size, "Scale W (*SCALE[3])", p.scale[3]);
+    addFloat(size, "IScale Variation (*ISCALEMIN)", p.iscale_var);
+    addFloat(size, "TScale Variation (*TSCALEMIN)", p.tscale_var);
+    addFloat(size, "FScale Variation (*FSCALEMIN)", p.fscale_var);
 
-    // Size
-    auto* size = makeSection("Size");
-    size->setText(0, "Size");
-    addFloat(size, "Size End", p.size_end);
-    addFloat(size, "Size Multiplier", p.size_mult);
-    addFloat(size, "Size Alpha", p.size_alpha);
+    // Rotation & Drag
+    auto* rot = makeSection("Rotation / Drag");
+    addFloat(rot, "Rotation Min (*PROTMIN)", p.rot_min, "deg");
+    addFloat(rot, "Rotation Variance (*PROTVAR)", p.rot_var, "deg/s");
+    addFloat(rot, "Drag (*PDRAG)", p.drag);
+    addFloat(rot, "Rotation X (*ROTATION[0])", p.rotation[0], "deg");
+    addFloat(rot, "Rotation Y (*ROTATION[1])", p.rotation[1], "deg");
+    addFloat(rot, "Rotation Z (*ROTATION[2])", p.rotation[2], "deg");
+    addFloat(rot, "Rotation W (*ROTATION[3])", p.rotation[3], "deg");
 
-    // Rotation & Spin
-    auto* rot = makeSection("Rotation / Spin");
-    rot->setText(0, "Rotation / Spin");
-    addFloat(rot, "Pad Rotation 1", p.pad_rotation_1);
-    addFloat(rot, "Pad Rotation 2", p.pad_rotation_2);
-    addFloat(rot, "Pad Rotation 3", p.pad_rotation_3);
-    addFloat(rot, "Rotation Speed", p.rotation_speed, "deg/s");
-    addFloat(rot, "Spin Start", p.spin_start, "deg");
-    addFloat(rot, "Spin Min", p.spin_min, "deg/s");
-    addFloat(rot, "Spin Max", p.spin_max, "deg/s");
-    addFloat(rot, "Spin Variation", p.spin_var, "deg/s");
-    addFloat(rot, "Spin Damping", p.spin_damp);
-    addFloat(rot, "Spin Speed", p.spin_speed, "deg/s");
-    addHex(rot, "Spin Flags", p.spin_flags);
+    // Emitter Properties
+    auto* emitter = makeSection("Emitter Properties");
+    emitter->setExpanded(true);
+    addFloat(emitter, "Emit Rate (*ERATE)", p.emit_rate, "/s");
+    addFloat(emitter, "Gravity (*EGRAVITY)", p.gravity, "u/s2");
+    addFloat(emitter, "Cone Radius (*ECONERAD)", p.cone_radius, "deg");
+    addFloat(emitter, "Max Particles (*EMAXPARTICLE)", p.max_particles);
+    addFloat(emitter, "Plane W (*EPLANEW)", p.plane_w);
+    addFloat(emitter, "Plane H (*EPLANEH)", p.plane_h);
+    addFloat(emitter, "Plane D (*EPLANED)", p.plane_d);
+    addUint(emitter, "Volume Type (*EVOLUME)", p.volume_type);
+    addFloat(emitter, "Sim Life (*ESIMLIFE)", p.sim_life, "s");
+    addFloat(emitter, "Emitter Life (*ELIFE)", p.emitter_life, "s");
+    addFloat(emitter, "Burst Count (*NBURST)", p.num_burst);
 
-    // Acceleration
-    auto* accel = makeSection("Acceleration");
-    accel->setText(0, "Acceleration");
-    addFloat(accel, "Accel Y", p.accel_y, "u/s2");
-    addFloat(accel, "Accel Z", p.accel_z, "u/s2");
-    addFloat(accel, "Pad Accel", p.pad_accel);
-    addFloat(accel, "Max Draw Distance", p.max_draw_dist, "units");
+    // Rendering
+    auto* render = makeSection("Rendering");
+    addReadonly(render, "Blend Mode",
+        QString("%1 (%2)").arg(blendModeName(p.blend_mode)).arg(p.blend_mode));
+    addUint(render, "Blend Mode ID (*EBLENDMODE)", p.blend_mode);
+    addFloat(render, "Time Delta Mult (*TDELTAMULT)", p.time_delta_mult, "x");
+    addFloat(render, "Anim Speed (*ANMSPEED)", p.anim_speed);
+    addUint(render, "Point Forces (*NUMPOINTFORCES)", p.num_point_forces);
+    addUint(render, "Emission Assets", p.num_emission_assets);
 
     // Bounds
     auto* bounds = makeSection("Bounds (AABB)");
-    bounds->setText(0, "Bounds (AABB)");
+    addFloat(bounds, "Min X", p.bounds_min[0]);
     addFloat(bounds, "Min Y", p.bounds_min[1]);
     addFloat(bounds, "Min Z", p.bounds_min[2]);
     addFloat(bounds, "Max X", p.bounds_max[0]);
     addFloat(bounds, "Max Y", p.bounds_max[1]);
     addFloat(bounds, "Max Z", p.bounds_max[2]);
-    addFloat(bounds, "Pad Bounds", p.pad_bounds);
 
-    // Designer state
-    auto* dstate = makeSection("Designer State");
-    dstate->setText(0, "Designer State");
-    addFloat(dstate, "Offset Y", p.designer_offset_y);
-    addFloat(dstate, "Offset Z", p.designer_offset_z);
-    addFloat(dstate, "Runtime 0x1AC", p.runtime_1ac);
-    addFloat(dstate, "Runtime 0x1B0", p.runtime_1b0);
-    addFloat(dstate, "Runtime 0x1B4", p.runtime_1b4);
-    addFloat(dstate, "Runtime 0x1B8", p.runtime_1b8);
+    // Path Properties
+    auto* path = makeSection("Path Properties");
+    addFloat(path, "Path Distance Min", p.path_dist_min);
+    addFloat(path, "Path Distance Var", p.path_dist_var);
+    addFloat(path, "Path Speed", p.path_speed);
 
-    // Rendering
-    auto* render = makeSection("Rendering");
-    addReadonly(render, "Blend Mode",
-        QString("%1 (%2)").arg(blendModeName(p.texture_blend_mode)).arg(p.texture_blend_mode));
-    addUint(render, "Blend Mode ID", p.texture_blend_mode);
-    addFloat(render, "Scale 0x188", p.scale_188);
-    addFloat(render, "Scale 0x18C", p.scale_18c);
-    addFloat(render, "Scale 0x190", p.scale_190);
-    addUint(render, "Loop Count", p.loop_count);
-    addUint(render, "Extra Flag 0x130", p.flag_extra_130);
+    // Emitter Offset
+    auto* offset = makeSection("Emitter Offset (*OFFSET)");
+    addFloat(offset, "Offset X", p.emitter_offset_x);
+    addFloat(offset, "Offset Y", p.emitter_offset_y);
+    addFloat(offset, "Offset Z", p.emitter_offset_z);
 
     // Textures — each entry is a sprite variant randomly assigned to particles
     auto* tex = makeSection(QString("Sprite Textures (%1)").arg(p.textures.size()));
@@ -962,11 +1004,11 @@ void MainWindow::buildPsbTree(QTreeWidgetItem* parent, lu::assets::PsbFile& p) {
                         .arg(static_cast<double>(c.b), 0, 'f', 3)
                         .arg(static_cast<double>(c.a), 0, 'f', 3));
             };
-            addKfColor("Start Color", kf.start_color);
-            addKfColor("Middle Color", kf.middle_color);
-            addKfColor("End Color", kf.end_color);
-            addKfColor("Birth Color", kf.birth_color);
-            addKfColor("Color 2", kf.color2);
+            addKfColor("Initial Color", kf.initial_color);
+            addKfColor("Trans Color 1", kf.trans_color_1);
+            addKfColor("Trans Color 2", kf.trans_color_2);
+            addKfColor("Final Color", kf.final_color);
+            addKfColor("Tint", kf.tint);
 
             // Show key parameter diffs from main block
             auto addKfDiff = [&](const QString& name, float kfVal, float mainVal) {
@@ -978,14 +1020,14 @@ void MainWindow::buildPsbTree(QTreeWidgetItem* parent, lu::assets::PsbFile& p) {
                 }
             };
             addKfDiff("Life Min", kf.life_min, p.life_min);
-            addKfDiff("Life Max", kf.life_max, p.life_max);
-            addKfDiff("Birth Rate", kf.birth_rate, p.birth_rate);
-            addKfDiff("Emit Speed", kf.emit_speed, p.emit_speed);
-            addKfDiff("Size Start", kf.size_start, p.size_start);
-            addKfDiff("Size End", kf.size_end, p.size_end);
-            addKfDiff("Gravity", kf.gravity, p.gravity);
-            addKfDiff("Spread Angle", kf.spread_angle, p.spread_angle);
-            addKfDiff("Rotation Speed", kf.rotation_speed, p.rotation_speed);
+            addKfDiff("Life Var", kf.life_var, p.life_var);
+            addKfDiff("Vel Min", kf.vel_min, p.vel_min);
+            addKfDiff("Initial Scale", kf.initial_scale, p.initial_scale);
+            addKfDiff("Trans Scale", kf.trans_scale, p.trans_scale);
+            addKfDiff("Final Scale", kf.final_scale, p.final_scale);
+            addKfDiff("Rot Min", kf.rot_min, p.rot_min);
+            addKfDiff("Rot Var", kf.rot_var, p.rot_var);
+            addKfDiff("Drag", kf.drag, p.drag);
         }
     }
 
@@ -1022,7 +1064,7 @@ void EditTexturesCommand::apply(
     uint32_t num) {
     window_->psb_.textures = tex;
     window_->psb_.texture_uv_rects = uvs;
-    window_->psb_.num_textures = num;
+    window_->psb_.num_assets = num;
     window_->glWidget_->loadEmitter(window_->psb_);
     window_->buildTree();
 }
